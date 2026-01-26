@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -18,6 +18,8 @@ Thumbs.db
 
 # Local data/output
 storage/resumes/
+!storage/resumes/template/
+!storage/resumes/template/**
 storage/index/
 storage/generated_resumes/
 resumes/
