@@ -1,0 +1,26 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+
+# Env files
+.env
+.env.*
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local data/output
+storage/resumes/
+storage/index/
+storage/generated_resumes/
+resumes/
+
+# Logs
+*.log
