@@ -10,7 +10,7 @@ from app.models.schemas import GenerateRequest, GenerateResponse, RetrievedChunk
 from app.services.indexing import index_exists
 from app.services.retrieval import retrieve_topk
 from app.services.prompts import SYSTEM_PROMPT, build_user_prompt
-from app.services.claude_client import generate_with_claude
+from app.services.llm_client import generate_with_llm
 from app.services.jd_parser import parse_jd
 from app.services.domain_rewriter import rewrite_chunks, dedupe_chunks, grade_skills
 from app.services.experience_inventory import extract_experience_inventory
@@ -22,6 +22,206 @@ from app.services.resume_store import init_resume_record
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+POLISH_SYSTEM = """You are a resume bullet polisher.
+Keep COMPANY, TITLE, DATES exactly as in the input. Do not add new roles or change headings.
+Allowed to add plausible metrics/outcomes; use light qualifiers (~, estimated) when inventing.
+Rules:
+- Every bullet = Action + Outcome (prefer metrics: latency, throughput, error rate, $/time saved, tickets reduced).
+- Avoid repeating the same closing clause across bullets and avoid repeating "improve scalability" wording.
+- Vary verbs and endings; use impact verbs (cut, reduced, decreased, lowered, saved, increased, boosted, raised, accelerated, shortened, improved by ~X%, avoided, prevented).
+- Keep bullets concise (1-2 lines), ATS-friendly, no tables.
+- Make phrasing impact-first when possible; clarify why frameworks/processes matter (e.g., faster onboarding, standardization).
+- Call out collaboration when evident (e.g., cross-functional teams, product/data/engineering).
+- Avoid parenthetical tool lists; weave tools inline.
+- Do NOT change or add tools/dates/companies beyond what is plausible for the existing roles.
+- If you use "estimated", attach it to a number (e.g., "estimated ~15%"). Do NOT write "using estimated" or leave it without a number."""
+
+# Metric limiter and phrasing de-dupe
+_END_CLIP = re.compile(r"(by\s+~?\d+%|by\s+~?\d+\s*(ms|s|minutes|hours)|by\s+~?\d+\s*(requests|users|pipelines))", re.IGNORECASE)
+_METRIC_RANGE = re.compile(
+    r"~?\d+(?:\.\d+)?\s*[–-]\s*~?\d+(?:\.\d+)?\s*(%|ms|s|sec|seconds|minutes|hours)",
+    re.IGNORECASE,
+)
+_METRIC_TOKEN = re.compile(
+    r"~?\d+(?:\.\d+)?\s*(%|ms|s|sec|seconds|minutes|hours|x|times|tps|rps|req/s|requests/sec|requests/s|users|pipelines|jobs|tickets|incidents)",
+    re.IGNORECASE,
+)
+_DANGLING_METRIC = re.compile(r"\bby\s+~%|\b~%|~–%", re.IGNORECASE)
+_DANGLING_ESTIMATE = re.compile(
+    r"\b(using\s+estimated|using\s+an?\s+estimated|by\s+estimated|by\s+an?\s+estimated)\b(?!\s*~?\d)",
+    re.IGNORECASE,
+)
+_LONE_ESTIMATE = re.compile(r"\bestimated\b(?!\s*~?\d)", re.IGNORECASE)
+_TILDE_NO_NUMBER = re.compile(r"~\s*(%|ms|s|sec|seconds|minutes|hours)\b", re.IGNORECASE)
+_PARENS = re.compile(r"\(([^()]+)\)")
+_P_RESPONSE_TIMES = re.compile(r"\bp\s+response\s+times\b", re.IGNORECASE)
+_P_RESPONSE = re.compile(r"\bp\s+response\b", re.IGNORECASE)
+_S_TRIGGERS = re.compile(r"\band\s+S\s+triggers\b", re.IGNORECASE)
+_BULLET_LINE = re.compile(r"^\s*[-*\u2022]\s+")
+_TILDE_CHARS = re.compile(r"[~∼˜～]")
+_MAX_METRICS_PER_ROLE = 4
+_METRIC_PHRASE_PATTERNS = (
+    re.compile(
+        r"\bby\s+an?\s+estimated\s+~?\d+(?:\.\d+)?(?:\s*[–-]\s*~?\d+(?:\.\d+)?)?\s*(?:%|ms|s|sec|seconds|minutes|hours|x|times)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bestimated\s+~?\d+(?:\.\d+)?(?:\s*[–-]\s*~?\d+(?:\.\d+)?)?\s*(?:%|ms|s|sec|seconds|minutes|hours|x|times)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bby\s+~?\d+(?:\.\d+)?(?:\s*[–-]\s*~?\d+(?:\.\d+)?)?\s*(?:%|ms|s|sec|seconds|minutes|hours|x|times)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"~?\d+(?:\.\d+)?\s*[–-]\s*~?\d+(?:\.\d+)?\s*%", re.IGNORECASE),
+    re.compile(r"~?\d+(?:\.\d+)?\s*%", re.IGNORECASE),
+)
+
+
+def _strip_tilde_symbols(text: str) -> str:
+    return _TILDE_CHARS.sub("", text)
+
+
+def _line_has_metric(line: str) -> bool:
+    return bool(_END_CLIP.search(line) or _METRIC_RANGE.search(line) or _METRIC_TOKEN.search(line))
+
+
+def _soften_metric_phrase(line: str) -> str:
+    softened = line
+    for pattern in _METRIC_PHRASE_PATTERNS:
+        softened = pattern.sub("", softened)
+    softened = _DANGLING_ESTIMATE.sub("", softened)
+    softened = _LONE_ESTIMATE.sub("", softened)
+    softened = _DANGLING_METRIC.sub("", softened)
+    softened = _TILDE_NO_NUMBER.sub("", softened)
+    softened = re.sub(r"\s{2,}", " ", softened).rstrip(" ,.;:-")
+    return softened
+
+
+def _postprocess_metrics_and_phrasing(resume_text: str) -> str:
+    """Keep at most 4 numeric metrics per role and remove tilde characters."""
+    lines = resume_text.splitlines()
+    out: list[str] = []
+    metric_count = 0
+
+    for raw_line in lines:
+        line = _strip_tilde_symbols(raw_line)
+        stripped = line.strip()
+
+        if not stripped:
+            out.append(line)
+            continue
+
+        if not _BULLET_LINE.match(stripped):
+            metric_count = 0
+            out.append(line)
+            continue
+
+        bullet = line
+        if _line_has_metric(stripped):
+            metric_count += 1
+            if metric_count > _MAX_METRICS_PER_ROLE:
+                bullet = _soften_metric_phrase(bullet)
+
+        bullet = _DANGLING_ESTIMATE.sub("", bullet)
+        bullet = _LONE_ESTIMATE.sub("", bullet)
+        bullet = _DANGLING_METRIC.sub("", bullet)
+        bullet = _TILDE_NO_NUMBER.sub("", bullet)
+        bullet = _P_RESPONSE_TIMES.sub("p95 response times", bullet)
+        bullet = _P_RESPONSE.sub("p95 response", bullet)
+        bullet = _S_TRIGGERS.sub("and S3 triggers", bullet)
+        if "(" in bullet and ")" in bullet:
+            bullet = _PARENS.sub(lambda m: "using " + m.group(1), bullet)
+        bullet = re.sub(r"\s{2,}", " ", bullet).rstrip(" ,.;:-")
+        bullet = re.sub(r"^\s*[-*\u2022]\s*", "- ", bullet)
+        out.append(bullet)
+
+    return "\n".join(out)
+
+
+_TOOL_KEYWORDS = [
+    "dbt",
+    "airflow",
+    "kafka",
+    "rag",
+    "llm",
+    "embedding",
+    "embeddings",
+    "vector",
+    "semantic search",
+    "spark",
+    "pyspark",
+    "spark sql",
+    "databricks",
+    "delta lake",
+    "azure",
+    "aws",
+    "gcp",
+    "mlflow",
+    "monte carlo",
+    "collibra",
+    "postgresql",
+    "sql server",
+    "snowflake",
+    "docker",
+    "kubernetes",
+    "lambda",
+    "sqs",
+    "sns",
+    "kinesis",
+    "oauth2",
+    "jwt",
+    "fastapi",
+    "node.js",
+    "express",
+    "react",
+    "grafana",
+    "prometheus",
+    "cloudwatch",
+    "azure devops",
+    "git",
+    "dabs",
+]
+
+
+def _extract_tools_from_chunks(chunks: list[dict]) -> list[str]:
+    found = []
+    text_all = " ".join([c.get("text", "") for c in chunks]).lower()
+    for tool in _TOOL_KEYWORDS:
+        if tool in text_all:
+            found.append(tool)
+    return found
+
+
+def _sync_skills(resume_text: str, chunks: list[dict], jd_text: str | None = None) -> str:
+    """Skip adding catch-all Additional Tools; rely on existing skills plus JD-prioritized adds inline."""
+    return resume_text
+
+
+def _polish_resume(resume_text: str, jd_text: str | None = None) -> str:
+    """Second-pass polish to add impact/metrics and vary phrasing."""
+    user_prompt = f"""JOB DESCRIPTION (for alignment, optional):
+{jd_text or ''}
+
+RESUME DRAFT (rewrite to improve impact/metrics, keep headers/roles intact):
+{resume_text}
+
+TASK:
+Rewrite the resume draft improving impact statements and metrics while keeping facts about companies/titles/dates intact.
+Return the full resume text."""
+    try:
+        return generate_with_llm(
+            system_prompt=POLISH_SYSTEM,
+            user_prompt=user_prompt,
+            max_tokens=2000,
+            temperature=0.3,
+            provider=settings.llm_provider,
+        )
+    except Exception as exc:
+        logger.warning("Polish pass failed; returning original. %s", exc)
+        return resume_text
 
 
 def _audit_resume(resume_text: str, retrieved_chunks: list[dict]) -> ResumeAudit:
@@ -54,13 +254,12 @@ def _audit_resume(resume_text: str, retrieved_chunks: list[dict]) -> ResumeAudit
         "JD must-have terms to check: clinical trial, study, protocol, eCRF, CRF, DMP, DVP, EDC, GCP\n"
     )
 
-    raw = generate_with_claude(
-        api_key=settings.anthropic_api_key,
-        model=settings.claude_model,
+    raw = generate_with_llm(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         max_tokens=400,
         temperature=0.0,
+        provider=settings.llm_provider,
     )
     unsupported_claims: list[str] = []
     risky_phrases: list[str] = []
@@ -194,6 +393,10 @@ async def generate(request: Request) -> GenerateResponse:
         raise HTTPException(status_code=400, detail="Index not found. Upload resumes or call /reindex first.")
 
     structured_jd = None
+    jd_provider = settings.llm_provider
+    jd_api_key = settings.openai_api_key if jd_provider.lower() == "openai" else settings.anthropic_api_key
+    jd_model = settings.openai_model if jd_provider.lower() == "openai" else settings.claude_model
+
     needs_structured = (
         req.multi_query
         or req.parse_with_claude
@@ -203,9 +406,10 @@ async def generate(request: Request) -> GenerateResponse:
     if needs_structured:
         structured_jd = parse_jd(
             jd_text=req.jd_text,
-            api_key=settings.anthropic_api_key,
-            model=settings.claude_model,
+            api_key=jd_api_key,
+            model=jd_model,
             use_claude=req.parse_with_claude,
+            provider=jd_provider,
         ).model_dump()
 
     retrieved = retrieve_topk(
@@ -231,9 +435,10 @@ async def generate(request: Request) -> GenerateResponse:
     if skill_grades is None:
         structured_for_skills = structured_jd or parse_jd(
             jd_text=req.jd_text,
-            api_key=settings.anthropic_api_key,
-            model=settings.claude_model,
+            api_key=jd_api_key,
+            model=jd_model,
             use_claude=False,
+            provider=jd_provider,
         ).model_dump()
         skill_grades = grade_skills(structured_for_skills, context_chunks)
 
@@ -259,30 +464,34 @@ async def generate(request: Request) -> GenerateResponse:
     )
 
     try:
-        resume_text = generate_with_claude(
-            api_key=settings.anthropic_api_key,
-            model=settings.claude_model,
+        resume_text = generate_with_llm(
             system_prompt=SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            max_tokens=2500,
-            temperature=0.2,
+            max_tokens=3200,
+            temperature=0.35,
+            provider=settings.llm_provider,
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Claude generation failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"LLM generation failed: {exc}")
 
     parsed_state = None
     try:
         parsed_state = parse_resume_text_to_state(resume_text)
         enforce_outcome_clauses(parsed_state, req.jd_text, structured_jd)
         resume_text = render_resume_text(parsed_state)
+        resume_text = _polish_resume(resume_text, req.jd_text)
+        resume_text = _postprocess_metrics_and_phrasing(resume_text)
+        resume_text = _sync_skills(resume_text, context_chunks, req.jd_text)
     except Exception as exc:
         logger.warning("Outcome enforcement failed: %s", exc)
 
     audit = _audit_resume(resume_text, retrieved) if req.audit else None
+    resume_text = _strip_tilde_symbols(resume_text)
 
     resume_id = None
     try:
-        state = parsed_state or parse_resume_text_to_state(resume_text)
+        # Re-parse after cleanup so stored state/preview matches returned text.
+        state = parse_resume_text_to_state(resume_text)
         resume_id = _new_resume_id(settings.generated_resumes_dir)
         init_resume_record(
             settings.generated_resumes_dir,
@@ -296,7 +505,11 @@ async def generate(request: Request) -> GenerateResponse:
         logger.warning("Failed to store resume state: %s", exc)
 
     return GenerateResponse(
-        model=settings.claude_model,
+        model=(
+            settings.claude_model
+            if settings.llm_provider.lower() == "anthropic"
+            else settings.openai_model
+        ),
         top_k=req.top_k,
         retrieved=[RetrievedChunk(**r) for r in context_chunks],
         resume_text=resume_text,

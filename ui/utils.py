@@ -64,7 +64,8 @@ def extract_resume_text(state: dict) -> str:
         lines.append("EDUCATION")
         lines.extend(education)
 
-    return "\n".join(lines).strip()
+    text = "\n".join(lines).strip()
+    return text.replace("~", "").replace("∼", "").replace("˜", "").replace("～", "")
 
 
 def safe_get(dct: dict, *keys: str, default: Any = "") -> Any:

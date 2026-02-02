@@ -1,6 +1,9 @@
 ﻿from pathlib import Path
 from typing import Dict, List
+import logging
 import re
+import tempfile
+import zipfile
 
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
@@ -32,6 +35,9 @@ _DATE_RANGE_RE = re.compile(
     re.IGNORECASE,
 )
 _RIGHT_TAB_STOP_INCH = 6.5
+_MAX_DOCX_BYTES = 1_800_000
+
+logger = logging.getLogger(__name__)
 
 
 def sanitize_name(name: str) -> str:
@@ -156,6 +162,88 @@ def _ensure_blank_before_education(doc: Document) -> None:
     target._p.addprevious(blank._p)
 
 
+def _strip_embedded_font_nodes(font_table_xml: bytes) -> bytes:
+    """Remove embedded font tags while preserving original namespace prefixes."""
+    try:
+        xml = font_table_xml.decode("utf-8")
+    except UnicodeDecodeError:
+        return font_table_xml
+
+    # Preserve prefix mappings/MC attributes; strip only embed tag elements.
+    xml = re.sub(
+        r"<w:embed(?:Regular|Bold|Italic|BoldItalic)\b[^>]*/>",
+        "",
+        xml,
+        flags=re.IGNORECASE,
+    )
+    return xml.encode("utf-8")
+
+
+def _strip_font_relationships(font_rels_xml: bytes) -> bytes:
+    """Remove Relationship nodes that target embedded font binaries."""
+    try:
+        xml = font_rels_xml.decode("utf-8")
+    except UnicodeDecodeError:
+        return font_rels_xml
+
+    xml = re.sub(
+        r'<Relationship\b[^>]*\bTarget=["\']fonts/[^"\']+["\'][^>]*/>',
+        "",
+        xml,
+        flags=re.IGNORECASE,
+    )
+    return xml.encode("utf-8")
+
+
+def _optimize_docx_file(docx_path: Path, max_bytes: int = _MAX_DOCX_BYTES) -> None:
+    """Shrink DOCX size by stripping embedded fonts when above threshold."""
+    try:
+        if not docx_path.exists() or docx_path.stat().st_size <= max_bytes:
+            return
+    except OSError:
+        return
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", dir=str(docx_path.parent), delete=False) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+
+    try:
+        with zipfile.ZipFile(docx_path, "r") as src, zipfile.ZipFile(
+            tmp_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as dst:
+            for info in src.infolist():
+                name = info.filename
+                if name.startswith("word/fonts/"):
+                    continue
+
+                data = src.read(name)
+                if name == "word/fontTable.xml":
+                    data = _strip_embedded_font_nodes(data)
+                elif name == "word/_rels/fontTable.xml.rels":
+                    data = _strip_font_relationships(data)
+
+                dst.writestr(name, data)
+
+        original_size = docx_path.stat().st_size
+        optimized_size = tmp_path.stat().st_size if tmp_path.exists() else original_size
+        if optimized_size < original_size:
+            tmp_path.replace(docx_path)
+            logger.info(
+                "Optimized DOCX %s: %d -> %d bytes",
+                docx_path.name,
+                original_size,
+                optimized_size,
+            )
+        else:
+            tmp_path.unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning("DOCX optimization skipped for %s: %s", docx_path, exc)
+        tmp_path.unlink(missing_ok=True)
+
+
+
 def export_resume_to_docx(template_path: Path, sections: Dict[str, List[str]], output_path: Path) -> None:
     """Render resume sections into the DOCX template and save it."""
     doc = Document(template_path)
@@ -172,6 +260,7 @@ def export_resume_to_docx(template_path: Path, sections: Dict[str, List[str]], o
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(output_path)
+    _optimize_docx_file(output_path)
 
 
 def export_docx_from_state(state: ResumeState, template_path: Path, output_path: Path) -> None:

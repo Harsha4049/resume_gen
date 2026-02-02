@@ -1,22 +1,23 @@
 ﻿from typing import Optional, Dict, List
 import re
 
-SYSTEM_PROMPT = """You are a resume writing assistant that MUST be truthful about ROLES but CAN INVENT OUTCOMES.
+SYSTEM_PROMPT = """You are a resume writing assistant that MUST keep COMPANY / TITLE / DATES truthful, but you CAN INVENT OUTCOMES and JD-aligned skills.
 
 HARD RULES (non-negotiable):
-- Use ONLY the provided resume context snippets as your factual source for COMPANY, TITLE, DATES, TOOLS USED.
-- Do NOT invent companies, titles, dates, or tools not mentioned in snippets.
-- Do NOT claim hands-on experience with a tool unless it clearly appears in the snippets.
+- Never change company names, titles, or dates that appear in role headers or snippets.
+- You MAY add JD-relevant tools/skills even if they are not in the snippets, as long as they are plausible for the role; prefer evidence-backed tools first.
+- Do NOT invent new companies, titles, or date ranges.
+- Do NOT add meta commentary in the output (e.g., "for JD alignment", "based on JD", "exposure", "familiarity").
 
 OUTCOME INVENTION RULES (encouraged):
 - IF a bullet describes an activity but lacks an outcome/impact, INVENT a plausible outcome based on:
   * The tool/activity described (e.g., "built dashboards" → "reducing reporting time by ~10%")
   * The industry context (e.g., "financial data" → "improving accuracy/compliance")
   * The role seniority (e.g., senior roles → higher impact claims)
-- Use conservative language: "estimated", "likely", "contributed to", "supported" when outcome is inferred.
-- Avoid specific numbers unless context supports them. Use ranges ("~10-15%") or vague terms ("several", "a few").
-- DO NOT invent tools, only outcomes for existing tools.
-- DO NOT claim expertise with tools that don't appear in the snippets.
+- Use light qualifiers when you invent numbers: "estimated", "~", "likely", "contributed to", "supported".
+- If you use "estimated", attach it to a number (e.g., "estimated ~15%"). Do NOT write "using estimated" or leave it without a number.
+- Prefer quantitative impacts (latency, throughput, error rate, $/time saved, % change). If no number fits, state a concrete benefit (reliability, accuracy, risk reduction).
+- You MAY introduce JD-aligned tools/skills to achieve the outcome if plausible for the role; avoid far-fetched tools.
 
 OUTCOME INVENTION EXAMPLES:
 - "Wrote SQL queries" → "Wrote SQL queries optimizing data retrieval by ~10-15%"
@@ -30,11 +31,48 @@ CLINICAL TRIAL SAFETY:
 
 Keep output ATS-friendly: simple headings, clean bullets, no tables.
 Each bullet MUST include an action plus an outcome (real or inferred conservatively).
+
+STYLE & VARIETY RULES:
+- Avoid filler phrases; specifically, use phrases like "improve scalability"/"improving scalability" at most once per role.
+- Every bullet must pair Action + Outcome; include scope (data volume/RPS/pipelines/users) and impact. Prefer concrete metrics (latency, throughput, error rate, $/time savings, % change). If no metric is known, state a clear benefit (reliability, accuracy, freshness, SLA, risk reduction). It is OK to invent plausible ranges (e.g., "~10-20%" or "reduced by ~seconds/minutes") when evidence is missing and reasonable for the role. Max 4 numeric metrics per role.
+- Vary phrasing across bullets; do NOT reuse the same closing clause more than once per role.
+- Preferred impact verbs: cut, reduced, decreased, lowered, shrank, saved, increased, boosted, raised, accelerated, shortened, improved by ~X%, avoided, prevented.
+- Weave tools into sentences (avoid parenthetical tool lists).
+- In TECHNICAL SKILLS, list skills only. Do NOT add qualifiers like "for JD alignment", "concepts", or "(Exposure/Familiarity)".
 """
 
 _MONTH_RE = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{4}"
 _DATE_RANGE_RE = re.compile(rf"({_MONTH_RE})\s*(?:-|to)\s*(Present|Current|{_MONTH_RE})", re.IGNORECASE)
 _BULLET_PREFIX = re.compile(r"^(?:[-*\u2022]|\d+\.)\s+")
+_SKILL_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bpython\b", re.I), "Python"),
+    (re.compile(r"\bsql\b", re.I), "SQL"),
+    (re.compile(r"\br\b", re.I), "R"),
+    (re.compile(r"\bnode\.?js\b", re.I), "Node.js"),
+    (re.compile(r"\baws\b", re.I), "AWS"),
+    (re.compile(r"\bazure\b", re.I), "Azure"),
+    (re.compile(r"\bgcp\b", re.I), "GCP"),
+    (re.compile(r"\bdatabricks\b", re.I), "Databricks"),
+    (re.compile(r"\bpyspark\b", re.I), "PySpark"),
+    (re.compile(r"\bspark sql\b", re.I), "Spark SQL"),
+    (re.compile(r"\bspark\b", re.I), "Spark"),
+    (re.compile(r"\bdelta lake\b", re.I), "Delta Lake"),
+    (re.compile(r"\bairflow\b", re.I), "Apache Airflow"),
+    (re.compile(r"\bdbt\b", re.I), "dbt"),
+    (re.compile(r"\bkafka\b", re.I), "Kafka"),
+    (re.compile(r"\bpostgresql\b", re.I), "PostgreSQL"),
+    (re.compile(r"\bsql server\b", re.I), "SQL Server"),
+    (re.compile(r"\bsnowflake\b", re.I), "Snowflake"),
+    (re.compile(r"\boauth2\b", re.I), "OAuth2"),
+    (re.compile(r"\brest api\b", re.I), "REST APIs"),
+    (re.compile(r"\bsftp\b", re.I), "SFTP"),
+    (re.compile(r"\bapi feeds?\b", re.I), "API feeds"),
+    (re.compile(r"\bllm\b", re.I), "LLMs"),
+    (re.compile(r"\bai agent\b", re.I), "AI Agents"),
+    (re.compile(r"\brag\b", re.I), "RAG"),
+    (re.compile(r"\bembedding(s)?\b", re.I), "Embeddings"),
+    (re.compile(r"\bsemantic search\b", re.I), "Semantic Search"),
+]
 
 
 def _extract_role_header_hints(chunks: list[dict]) -> list[str]:
@@ -77,6 +115,25 @@ def _extract_role_header_hints(chunks: list[dict]) -> list[str]:
                     return hints
 
     return hints
+
+
+def _extract_skill_seeds(jd_text: str, chunks: list[dict]) -> list[str]:
+    """Extract skills from JD + evidence chunks using known patterns."""
+    combined = jd_text + "\n" + "\n".join(c.get("text", "") for c in chunks)
+    found: list[str] = []
+    for pattern, label in _SKILL_PATTERNS:
+        if pattern.search(combined):
+            found.append(label)
+    # de-dupe preserving order
+    seen = set()
+    out = []
+    for item in found:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
 
 def _strip_title_parenthetical(title: str) -> str:
@@ -147,6 +204,7 @@ def build_user_prompt(
     role_header_block = _build_role_header_block(role_headers, role_hints)
 
     skill_block = ""
+    skill_seed_items: list[str] = []
     if skill_grades:
         strong = ", ".join(skill_grades.get("strong", []))
         working = ", ".join(skill_grades.get("working", []))
@@ -157,6 +215,8 @@ def build_user_prompt(
         required_direct = ", ".join(skill_grades.get("required_direct", []))
         required_derived = ", ".join(skill_grades.get("required_derived", []))
         required_missing = ", ".join(skill_grades.get("required_missing", []))
+        for key in ("required", "important", "optional", "strong", "working", "exposure"):
+            skill_seed_items.extend(skill_grades.get(key, []))
         skill_block = (
             "\nJD SKILLS (from parser):\n"
             f"Required: {required or 'None'}\n"
@@ -169,11 +229,28 @@ def build_user_prompt(
             f"Direct: {required_direct or 'None'}\n"
             f"Derived: {required_derived or 'None'}\n"
             f"Missing: {required_missing or 'None'}\n"
-            "\nSKILL CONFIDENCE (use these labels in the Skills section):\n"
+            "\nSKILL SIGNALS (guidance only, do NOT output these labels):\n"
             f"Strong: {strong or 'None'}\n"
             f"Working: {working or 'None'}\n"
             f"Exposure: {exposure or 'None'}\n"
-            "Use confident wording for Strong/Working items and conservative wording for Exposure.\n"
+            "Do not output Strong/Working/Exposure labels in TECHNICAL SKILLS.\n"
+            "Do not limit TECHNICAL SKILLS to only these lists; also include JD-critical tools.\n"
+        )
+
+    skill_seed_items.extend(_extract_skill_seeds(jd_text, retrieved_chunks))
+    # de-dupe preserving order
+    seen_skills = set()
+    skill_seed_items = [
+        item for item in skill_seed_items
+        if not (item.lower() in seen_skills or seen_skills.add(item.lower()))
+    ]
+    skill_seed_block = ""
+    if skill_seed_items:
+        skill_seed_block = (
+            "\nSKILLS TO COVER (JD + evidence):\n"
+            + ", ".join(skill_seed_items)
+            + "\n"
+            "Include these in TECHNICAL SKILLS. If a skill is not in evidence, do NOT claim hands-on usage in experience bullets.\n"
         )
 
     inventory_block = ""
@@ -208,6 +285,7 @@ RESUME CONTEXT SNIPPETS (retrieved):
 {context}
 {skill_block}
 {inventory_block}
+{skill_seed_block}
 {role_header_block}
 
 TASK:
@@ -215,40 +293,54 @@ Create a tailored resume draft using snippets as your factual base.
 INVENT PLAUSIBLE OUTCOMES where activities lack impact statements.
 Use conservative language ("estimated", "contributed to", "likely improved") for inferred outcomes.
 
+STYLE & VARIETY:
+- Avoid repeating the phrase "improve scalability"/"improving scalability" more than once per role.
+- Every bullet must have Action + Outcome; include scope (data volume/RPS/pipelines/users) and impact. Prefer quantitative metrics (latency, throughput, error rate, cost/time deltas). If no numbers, state a concrete benefit (reliability, accuracy, freshness, SLA, risk reduction). Max 4 numeric metrics per role.
+- Vary closing clauses; do NOT reuse the same ending across multiple bullets in a role.
+- Use impact verbs such as: cut, reduced, decreased, lowered, shrank, saved, increased, boosted, raised, accelerated, shortened, improved by ~X%, avoided, prevented.
+
 NON-NEGOTIABLE RULES:
 - NEVER change company names, job titles, or employment dates.
 - NEVER move experience from one company to another.
-- NEVER invent tools, platforms, certifications, or domain artifacts.
-- Use ONLY tools that appear in that company's evidence; do not swap tools across companies.
-- Preserve company domain language; do NOT introduce domain-specific tools without evidence.
+- Preserve company domain language; do NOT introduce domain-specific tools in EXPERIENCE bullets without evidence.
+- For EXPERIENCE bullets, prefer tools from that company's evidence; do NOT swap tools across companies.
+- You MAY include JD-critical tools in TECHNICAL SKILLS even if they are not in evidence;
 - DO INVENT: Plausible outcomes, metrics (with "estimated"/"~"), impact statements, business value.
 
 REQUIRED SKILLS HANDLING:
-- Include REQUIRED skills only when evidence exists (direct or derived).
-- If REQUIRED skills are missing from evidence, do NOT claim them. Use conservative wording if needed, or omit.
+- Include REQUIRED skills when evidence exists (direct or derived).
+- If REQUIRED skills are missing from evidence, include them only in TECHNICAL SKILLS; do NOT claim hands-on usage in bullets.
 - Choose language based on evidence: Direct = "Designed/Implemented/Led/Built", Derived = "Worked with/Supported/Contributed to/Involved in".
 
 OUTCOME INVENTION GUIDANCE:
 - For each bullet, ask: "What was the business impact of this activity?"
 - If not stated, infer from context: tools used, data types, audience, scale, industry domain.
-- Use conservative markers: "estimated", "~", "likely", "contributed to", "helped", "supported".
+- Use conservative markers: "estimated", "~", "likely", "contributed to", "helped", "supported" when you invent; numeric ranges are encouraged.
 - Examples:
   * "Designed data warehouse" → "Designed data warehouse supporting multiple reporting requests"
   * "Optimized SQL queries" → "Optimized SQL queries reducing execution time by ~10%"
   * "Led data validation" → "Led data validation process improving data quality accuracy"
 
 Output format:
-1) PROFESSIONAL SUMMARY (3-4 lines)
-2) CORE SKILLS (bulleted, grouped by category if obvious)
-3) EXPERIENCE HIGHLIGHTS (10-16 bullets total; strong action verbs; align with JD keywords; invent outcomes where missing)
-4) OPTIONAL: "KEYWORDS COVERAGE" (list 12-20 JD keywords you covered)
+1) PROFESSIONAL SUMMARY
+   - 3-4 lines; pick the dominant role (e.g., Data Engineer) and include total experience (e.g., "~5+ years") if dates support it; otherwise use a conservative "~5+ years".
+2) TECHNICAL SKILLS
+   - Bulleted, grouped by category; weave tools into sensible categories (no giant catch-all lists).
+   - Use JD-aligned category labels (e.g., Database Development, Data Management, ETL, Cloud/DevOps, Monitoring/Compliance, APIs/Auth, Programming).
+   - Align to JD; include JD-critical tools even if not in evidence, but do NOT claim hands-on usage in bullets.
+   - Include skills from SKILLS TO COVER; do NOT output Strong/Working/Exposure labels or meta phrases like "for JD alignment".
+3) PROFESSIONAL EXPERIENCE
+   - 10-16 bullets total across roles; strong action verbs; align with JD keywords.
+   - Every bullet MUST have Action + Outcome; include scope (data volume/RPS/pipelines/users) and impact. Max 4 numeric metrics per role; the rest may be qualitative but specific (reliability, SLA, freshness, error reduction, ticket reduction, cost/time savings).
+4) (Optional) KEYWORDS COVERAGE
+   - 12-20 JD keywords you covered, note impacts where possible.
 
 Quality bar:
 - Prioritize relevance to JD.
 - Every bullet MUST have Action + Outcome (inferred outcomes are OK with conservative language).
-- Keep bullets punchy (1-2 lines each).
-- Do not repeat the same bullet wording.
-- NO filler phrases like "worked on" or "responsible for".
+- Keep bullets clear (1-3 lines) with scope + impact; ATS-friendly.
+- Vary phrasing; do not repeat closing clauses or filler like "improve scalability" more than once per role.
+- No filler phrases like "worked on" or "responsible for".
 """
     if not experience_inventory:
         return base_prompt
@@ -259,12 +351,19 @@ RESUME CONTEXT SNIPPETS (retrieved):
 {context}
 {skill_block}
 {inventory_block}
+{skill_seed_block}
 {role_header_block}
 
 TASK:
 Create a tailored resume draft using snippets as your factual base. 
 INVENT PLAUSIBLE OUTCOMES where activities lack impact statements.
 Use conservative language ("estimated", "contributed to", "likely improved") for inferred outcomes.
+
+STYLE & VARIETY:
+- Avoid repeating the phrase "improve scalability"/"improving scalability" more than once per role.
+- Every bullet must have Action + Outcome; prefer quantitative metrics (latency, throughput, error rate, cost/time deltas). If no numbers, state a concrete benefit (reliability, accuracy, risk reduction).
+- Vary closing clauses; do NOT reuse the same ending across multiple bullets in a role.
+- Use impact verbs such as: cut, reduced, decreased, lowered, shrank, saved, increased, boosted, raised, accelerated, shortened, improved by ~X%, avoided, prevented.
 
 When EXPERIENCE INVENTORY is provided:
 - Under PROFESSIONAL EXPERIENCE, output each role in this format:
@@ -280,14 +379,14 @@ When EXPERIENCE INVENTORY is provided:
 NON-NEGOTIABLE RULES:
 - NEVER change company names, job titles, or employment dates.
 - NEVER move experience from one company to another.
-- NEVER invent tools, platforms, certifications, or domain artifacts.
-- Use ONLY tools that appear in that company's evidence; do not swap tools across companies.
-- Preserve company domain language; do NOT introduce domain-specific tools without evidence.
+- Preserve company domain language; do NOT introduce domain-specific tools in EXPERIENCE bullets without evidence.
+- For EXPERIENCE bullets, prefer tools from that company's evidence; do NOT swap tools across companies.
+- You MAY include JD-critical tools in TECHNICAL SKILLS even if they are not in evidence;
 - DO INVENT: Plausible outcomes, metrics (with "estimated"/"~"), impact statements, business value.
 
 REQUIRED SKILLS HANDLING:
-- Include REQUIRED skills only when evidence exists (direct or derived).
-- If REQUIRED skills are missing from evidence, do NOT claim them. Use conservative wording if needed, or omit.
+- Include REQUIRED skills when evidence exists (direct or derived).
+- If REQUIRED skills are missing from evidence, include them only in TECHNICAL SKILLS; do NOT claim hands-on usage in bullets.
 - Choose language based on evidence: Direct = "Designed/Implemented/Led/Built", Derived = "Worked with/Supported/Contributed to/Involved in".
 
 OUTCOME INVENTION GUIDANCE:
@@ -300,9 +399,9 @@ OUTCOME INVENTION GUIDANCE:
   * "Led data validation" → "Led data validation process improving data quality accuracy"
 
 Output format (exact sections):
-PROFESSIONAL SUMMARY (tailored to JD)
-TECHNICAL SKILLS (tailored to JD)
-PROFESSIONAL EXPERIENCE (role-by-role)
+PROFESSIONAL SUMMARY
+TECHNICAL SKILLS
+PROFESSIONAL EXPERIENCE
 
 Quality bar:
 - Prefer direct evidence; be conservative with derived evidence.

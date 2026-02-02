@@ -4,7 +4,7 @@ from collections import Counter
 from typing import Optional
 
 from app.models.schemas import JDParseResponse
-from app.services.claude_client import generate_with_claude
+from app.services.llm_client import generate_with_llm
 
 
 _STOPWORDS = {
@@ -116,6 +116,7 @@ def parse_jd(
     api_key: str,
     model: str,
     use_claude: bool = True,
+    provider: str | None = None,
 ) -> JDParseResponse:
     """Parse a JD into structured fields using Claude with a rule-based fallback."""
     if use_claude:
@@ -136,13 +137,13 @@ def parse_jd(
             f"JOB DESCRIPTION:\n{jd_text}"
         )
         try:
-            raw = generate_with_claude(
-                api_key=api_key,
-                model=model,
+            raw = generate_with_llm(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=600,
                 temperature=0.0,
+                provider=provider,
+                model=model,
             )
             data = json.loads(raw)
         except Exception:

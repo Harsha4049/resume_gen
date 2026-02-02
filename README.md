@@ -3,7 +3,9 @@
 ## Setup
 
 1) Put resume files in `storage/resumes/` (supported: .pdf, .docx, .txt) or upload via `/upload-resumes`.
-2) Copy `.env` and set `ANTHROPIC_API_KEY`.
+2) Copy `.env` and set `LLM_PROVIDER` plus the corresponding API key.
+   - For Anthropic: `LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY`.
+   - For OpenAI: `LLM_PROVIDER=openai` and `OPENAI_API_KEY`.
 3) Install requirements:
 
 ```

@@ -1,4 +1,7 @@
 ﻿import os
+import subprocess
+import sys
+from pathlib import Path
 import streamlit as st
 
 from api_client import ApiClient
@@ -31,6 +34,7 @@ def _init_state():
         "suggested_patches": None,
         "blocked_suggestions": None,
         "overrides_saved_count": 0,
+        "last_export_data": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -41,6 +45,60 @@ _init_state()
 
 client = ApiClient(st.session_state.backend_url)
 
+
+def _get_export_open_target(export_data: dict | None) -> str | None:
+    if not export_data:
+        return None
+    for key in ("final_resume_docx_path", "resume_docx_path", "final_saved_dir", "saved_dir"):
+        value = export_data.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _open_path_in_file_manager(path_value: str) -> tuple[bool, str]:
+    try:
+        target = Path(path_value)
+        if not target.exists():
+            return False, f"Path does not exist: {target}"
+        if os.name == "nt":
+            if target.is_file():
+                subprocess.Popen(["explorer", f"/select,{target}"])
+            else:
+                os.startfile(str(target))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(target)] if target.is_file() else ["open", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(target.parent if target.is_file() else target)])
+        return True, "Opened saved resume location."
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _save_docx_export() -> bool:
+    if not st.session_state.resume_id:
+        st.error("resume_id required")
+        return False
+    if not st.session_state.company_name or not st.session_state.position_name:
+        st.error("company_name and position_name are required")
+        return False
+
+    payload = {
+        "resume_id": st.session_state.resume_id,
+        "company_name": st.session_state.company_name,
+        "position_name": st.session_state.position_name,
+        "job_id": st.session_state.job_id or None,
+        "jd_text": st.session_state.jd_text or None,
+    }
+    res = client.post("/export-docx", json_body=payload)
+    if res["ok"]:
+        st.session_state.last_export_data = res["data"]
+        st.success("Export complete")
+        st.json(res["data"])
+        return True
+
+    st.error(res["error"])
+    return False
 
 
 st.markdown("""<style>
@@ -61,7 +119,22 @@ html, body, [class*='css'] {
   background: radial-gradient(1200px 800px at 10% 10%, #1b2230 0%, #0f1116 45%, #0b0d12 100%);
   color: var(--text);
 }
-.block-container { padding-top: 2.6rem; padding-bottom: 2rem; }
+.stApp header[data-testid="stHeader"] {
+  display: none;
+}
+[data-testid="stToolbar"] {
+  display: none;
+}
+[data-testid="stDecoration"] {
+  display: none;
+}
+[data-testid="stStatusWidget"] {
+  display: none;
+}
+#MainMenu {
+  visibility: hidden;
+}
+.block-container { padding-top: 0.9rem; padding-bottom: 2rem; }
 .section-label {
   font-size: 0.78rem;
   text-transform: uppercase;
@@ -76,17 +149,34 @@ html, body, [class*='css'] {
 }
 </style>""", unsafe_allow_html=True)
 
-@st.dialog("Health Check")
-def _health_check_dialog():
-    st.text_input("Backend URL", key="backend_url_dialog", value=st.session_state.backend_url)
-    if st.session_state.get("backend_url_dialog"):
-        st.session_state.backend_url = st.session_state.backend_url_dialog
-    health = client.get("/health")
-    if health["ok"]:
-        st.success("Connected")
-        st.json(health["data"])
-    else:
-        st.error(f"Health check failed: {health['error']}")
+@st.dialog("Backend URL")
+def _backend_url_dialog():
+    current = st.session_state.backend_url
+    st.text_input("Backend URL", key="backend_url_dialog", value=current)
+    candidate = (st.session_state.get("backend_url_dialog") or "").strip()
+
+    action_cols = st.columns(2, gap="small")
+    with action_cols[0]:
+        if st.button("Save URL", key="save_backend_url_dialog"):
+            if not candidate:
+                st.error("Backend URL cannot be empty")
+            else:
+                st.session_state.backend_url = candidate
+                st.success("Backend URL updated")
+                st.rerun()
+    with action_cols[1]:
+        if st.button("Save + Health Check", key="save_health_backend_url_dialog"):
+            if not candidate:
+                st.error("Backend URL cannot be empty")
+            else:
+                st.session_state.backend_url = candidate
+                probe_client = ApiClient(candidate)
+                health = probe_client.get("/health")
+                if health["ok"]:
+                    st.success("Connected")
+                    st.json(health["data"])
+                else:
+                    st.error(f"Health check failed: {health['error']}")
 
 
 @st.dialog("Load Resume")
@@ -110,32 +200,182 @@ def _load_resume_dialog():
                 st.error(res["error"])
 
 
+@st.dialog("ATS Score + Skill Gaps")
+def _ats_score_dialog():
+    st.text_area("JD text (required for ATS)", key="jd_text_ats_popup", height=180, value=st.session_state.jd_text)
+    jd_ats = (st.session_state.get("jd_text_ats_popup") or "").strip()
+    if jd_ats:
+        st.session_state.jd_text = jd_ats
+
+    if st.button("Run ATS Score", key="run_ats_score_popup"):
+        if not st.session_state.resume_id:
+            st.error("resume_id required")
+        elif not st.session_state.jd_text.strip():
+            st.error("JD text is required")
+        else:
+            payload = {
+                "jd_text": st.session_state.jd_text,
+                "resume_id": st.session_state.resume_id,
+                "top_n_skills": 25,
+                "strict_mode": True,
+            }
+            resp = client.post("/ats-score", json_body=payload)
+            if resp["ok"]:
+                st.session_state.ats_report = resp["data"]
+                st.success("ATS score computed")
+            else:
+                st.error(resp["error"])
+
+    if not st.session_state.ats_report:
+        st.info("Run ATS Score to view skill gaps.")
+        return
+
+    report = st.session_state.ats_report
+    st.metric("ATS Score", report.get("ats_score", 0))
+
+    required_rows = []
+    for item in report.get("required", []):
+        ev = item.get("evidence", [])
+        ev_str = ", ".join(
+            [f"{e.get('section')}:{e.get('role_id','')}/{e.get('bullet_index','')}" for e in ev]
+        )
+        required_rows.append({"skill": item.get("skill"), "status": item.get("status"), "evidence": ev_str})
+
+    preferred_rows = []
+    for item in report.get("preferred", []):
+        ev = item.get("evidence", [])
+        ev_str = ", ".join(
+            [f"{e.get('section')}:{e.get('role_id','')}/{e.get('bullet_index','')}" for e in ev]
+        )
+        preferred_rows.append({"skill": item.get("skill"), "status": item.get("status"), "evidence": ev_str})
+
+    st.subheader("Required Skills")
+    st.dataframe(required_rows, use_container_width=True, height=220)
+    st.subheader("Preferred Skills")
+    st.dataframe(preferred_rows, use_container_width=True, height=220)
+
+    missing_required = report.get("missing_required", [])
+    missing_preferred = report.get("missing_preferred", [])
+    if missing_required:
+        st.write("Missing Required:", missing_required)
+    if missing_preferred:
+        st.write("Missing Preferred:", missing_preferred)
+
+    if not (missing_required or missing_preferred):
+        st.info("All required skills are covered. Score may be capped if preferred skills are not detected.")
+        return
+
+    st.subheader("Include Missing Skills")
+    if not st.session_state.resume_state:
+        state_res = client.get(f"/resumes/{st.session_state.resume_id}")
+        if state_res["ok"]:
+            st.session_state.resume_state = state_res["data"].get("state")
+    roles = role_options(st.session_state.resume_state or {})
+    role_labels = [r[0] for r in roles]
+    role_ids = [r[1] for r in roles]
+
+    selected_items = []
+    all_missing = list(missing_required) + list(missing_preferred)
+    for idx, skill in enumerate(all_missing):
+        include_key = f"ats_popup_include_skill_{idx}"
+        role_key = f"ats_popup_include_role_{idx}"
+        level_key = f"ats_popup_include_level_{idx}"
+        bullet_key = f"ats_popup_include_bullet_{idx}"
+
+        if st.checkbox(f"Include: {skill}", key=include_key):
+            if roles:
+                role_choice = st.selectbox(
+                    f"Target Role for {skill}",
+                    role_labels,
+                    key=role_key,
+                )
+                role_id = role_ids[role_labels.index(role_choice)]
+            else:
+                role_id = ""
+                st.warning("No roles available in resume state.")
+
+            level = st.selectbox(
+                f"Evidence Level for {skill}",
+                options=["hands_on", "worked_with", "exposure"],
+                key=level_key,
+            )
+            proof = st.text_area(
+                f"Proof bullet for {skill} (optional)",
+                key=bullet_key,
+                placeholder="Optional: add context. Leave blank to auto-generate.",
+            )
+            selected_items.append(
+                {
+                    "skill": skill,
+                    "level": level,
+                    "role_id": role_id,
+                    "proof_bullet": proof,
+                }
+            )
+
+    if st.button("Include Selected Skills", key="include_selected_skills_ats_popup"):
+        if not selected_items:
+            st.error("Select at least one skill to include")
+        else:
+            invalid = [item for item in selected_items if not item["role_id"]]
+            if invalid:
+                st.error("Each selected skill needs a role")
+            else:
+                payload = {
+                    "items": selected_items,
+                    "jd_text": st.session_state.jd_text,
+                    "truth_mode": st.session_state.truth_mode,
+                    "strict_mode": True,
+                    "rewrite_overrides_with_claude": True,
+                    "export_docx": False,
+                }
+                res = client.post(
+                    f"/resumes/{st.session_state.resume_id}/include-skills",
+                    json_body=payload,
+                )
+                if res["ok"]:
+                    st.success("Skills added to resume")
+                    state_res = client.get(f"/resumes/{st.session_state.resume_id}")
+                    if state_res["ok"]:
+                        st.session_state.resume_state = state_res["data"].get("state")
+                    else:
+                        st.session_state.resume_state = res["data"].get("state")
+                    if st.session_state.resume_state:
+                        st.session_state.resume_text_preview = extract_resume_text(st.session_state.resume_state)
+                else:
+                    st.error(res["error"])
+
+
 header_left, header_right = st.columns([1.6, 1], gap="large")
 with header_left:
     st.markdown("""<div style='font-size:1.6rem;font-weight:600;'>Resume Generator</div>
 <div style='color:#9aa4b2;margin-bottom:1rem;'>JD-driven resume builder with skill confirmation</div>""", unsafe_allow_html=True)
 with header_right:
-    btn_row = st.columns([3, 1, 1], gap="small")
-    with btn_row[1]:
-        if st.button("Health Check", key="health_check_top"):
-            _health_check_dialog()
-    with btn_row[2]:
+    top_right_controls = st.columns([1.2, 1, 1], gap="small")
+    with top_right_controls[1]:
+        if st.button("Backend URL", key="backend_url_top"):
+            _backend_url_dialog()
+    with top_right_controls[2]:
         if st.button("Load Resume", key="load_resume_top"):
             _load_resume_dialog()
+    st.caption(f"Backend: {st.session_state.backend_url}")
 
 col_left, col_right = st.columns([1, 1.15], gap='large')
 
 with col_left:
-    st.text_input("Backend URL", key="backend_url")
-    st.caption("Backend URL can be changed and reloaded anytime.")
+    top_controls = st.columns([2.1, 2.1, 1.2], gap="small")
+    with top_controls[0]:
+        st.text_input("Company Name", key="company_name", label_visibility="visible")
+    with top_controls[1]:
+        st.text_input("Position Name", key="position_name", label_visibility="visible")
+    with top_controls[2]:
+        st.text_input("Job ID (optional)", key="job_id", label_visibility="visible")
 
-    # B) Job Info + Generation
-    with st.expander("Job Info + Generation", expanded=True):
-        st.text_input("Company Name", key="company_name")
-        st.text_input("Position Name", key="position_name")
-        st.text_input("Job ID (optional)", key="job_id")
-        st.text_area("Job Description", key="jd_text", height=200)
+    st.text_area("Job Description", key="jd_text", height=160)
 
+    # B) Generation Controls
+    with st.container(border=True):
+        st.markdown("#### Generation Controls")
         with st.expander("Advanced Options", expanded=False):
             st.selectbox("Truth Mode", options=["off", "balanced", "strict"], key="truth_mode")
             st.number_input("Top K", min_value=5, max_value=60, key="top_k")
@@ -149,190 +389,55 @@ with col_left:
             )
             st.number_input("Bullets per Role", min_value=5, max_value=25, key="bullets_per_role")
 
-        if st.button("Generate Preview"):
-            if not st.session_state.jd_text.strip():
-                st.error("JD text is required")
-            else:
-                payload = {
-                    "jd_text": st.session_state.jd_text,
-                    "top_k": st.session_state.top_k,
-                    "multi_query": st.session_state.multi_query,
-                    "parse_with_claude": st.session_state.parse_with_claude,
-                    "audit": False,
-                    "domain_rewrite": st.session_state.domain_rewrite,
-                    "target_company_type": st.session_state.target_company_type or None,
-                    "bullets_per_role": st.session_state.bullets_per_role,
-                }
-                resp = client.post("/generate", json_body=payload)
-                if resp["ok"]:
-                    data = resp["data"]
-                    st.session_state.resume_id = data.get("resume_id", "")
-                    st.session_state.resume_text_preview = data.get("resume_text", "")
-                    st.session_state.retrieved_chunks = data.get("retrieved", [])
-                    st.session_state.ats_report = None
-                    st.session_state.blocked_plan = None
-                    st.session_state.suggested_patches = None
-                    st.success(f"Generated. resume_id={st.session_state.resume_id}")
+        action_row = st.columns([1.1, 1.1, 1], gap="small")
+        with action_row[0]:
+            if st.button("Generate Preview"):
+                if not st.session_state.jd_text.strip():
+                    st.error("JD text is required")
                 else:
-                    st.error(resp["error"])
-
-        if st.session_state.resume_id:
+                    payload = {
+                        "jd_text": st.session_state.jd_text,
+                        "top_k": st.session_state.top_k,
+                        "multi_query": st.session_state.multi_query,
+                        "parse_with_claude": st.session_state.parse_with_claude,
+                        "audit": False,
+                        "domain_rewrite": st.session_state.domain_rewrite,
+                        "target_company_type": st.session_state.target_company_type or None,
+                        "bullets_per_role": st.session_state.bullets_per_role,
+                    }
+                    resp = client.post("/generate", json_body=payload)
+                    if resp["ok"]:
+                        data = resp["data"]
+                        st.session_state.resume_id = data.get("resume_id", "")
+                        st.session_state.resume_text_preview = data.get("resume_text", "")
+                        st.session_state.retrieved_chunks = data.get("retrieved", [])
+                        st.session_state.ats_report = None
+                        st.session_state.blocked_plan = None
+                        st.session_state.suggested_patches = None
+                        st.success(f"Generated. resume_id={st.session_state.resume_id}")
+                    else:
+                        st.error(resp["error"])
+        with action_row[1]:
             if st.button("Load Latest State"):
-                res = client.get(f"/resumes/{st.session_state.resume_id}")
-                if res["ok"]:
-                    st.session_state.resume_state = res["data"].get("state")
-                    st.session_state.resume_text_preview = extract_resume_text(st.session_state.resume_state)
-                    st.success("State refreshed")
+                if not st.session_state.resume_id:
+                    st.error("resume_id required")
                 else:
-                    st.error(res["error"])
+                    res = client.get(f"/resumes/{st.session_state.resume_id}")
+                    if res["ok"]:
+                        st.session_state.resume_state = res["data"].get("state")
+                        st.session_state.resume_text_preview = extract_resume_text(st.session_state.resume_state)
+                        st.success("State refreshed")
+                    else:
+                        st.error(res["error"])
+        with action_row[2]:
+            if st.button("ATS Popup", key="open_ats_popup_left_controls"):
+                _ats_score_dialog()
 
     # C) ATS Score + Skill Gaps
     with st.expander("ATS Score + Skill Gaps", expanded=False):
-        if not st.session_state.jd_text.strip():
-            st.text_area("JD text (required for ATS)", key="jd_text_ats", height=140)
-            if st.session_state.get("jd_text_ats"):
-                st.session_state.jd_text = st.session_state.jd_text_ats
-
-        if st.button("Run ATS Score"):
-            if not st.session_state.resume_id:
-                st.error("resume_id required")
-            elif not st.session_state.jd_text.strip():
-                st.error("JD text is required")
-            else:
-                payload = {
-                    "jd_text": st.session_state.jd_text,
-                    "resume_id": st.session_state.resume_id,
-                    "top_n_skills": 25,
-                    "strict_mode": True,
-                }
-                resp = client.post("/ats-score", json_body=payload)
-                if resp["ok"]:
-                    st.session_state.ats_report = resp["data"]
-                    st.success("ATS score computed")
-                else:
-                    st.error(resp["error"])
-
-        if st.session_state.ats_report:
-            report = st.session_state.ats_report
-            st.metric("ATS Score", report.get("ats_score", 0))
-            required_rows = []
-            for item in report.get("required", []):
-                ev = item.get("evidence", [])
-                ev_str = ", ".join(
-                    [
-                        f"{e.get('section')}:{e.get('role_id','')}/{e.get('bullet_index','')}"
-                        for e in ev
-                    ]
-                )
-                required_rows.append({"skill": item.get("skill"), "status": item.get("status"), "evidence": ev_str})
-            preferred_rows = []
-            for item in report.get("preferred", []):
-                ev = item.get("evidence", [])
-                ev_str = ", ".join(
-                    [
-                        f"{e.get('section')}:{e.get('role_id','')}/{e.get('bullet_index','')}"
-                        for e in ev
-                    ]
-                )
-                preferred_rows.append({"skill": item.get("skill"), "status": item.get("status"), "evidence": ev_str})
-
-            st.subheader("Required Skills")
-            st.dataframe(required_rows, use_container_width=True, height=240)
-            st.subheader("Preferred Skills")
-            st.dataframe(preferred_rows, use_container_width=True, height=240)
-            missing_required = report.get("missing_required", [])
-            missing_preferred = report.get("missing_preferred", [])
-            st.write("Missing Required:", missing_required)
-
-            if missing_required or missing_preferred:
-                st.subheader("Why score is low")
-                if missing_required:
-                    st.write("Missing Required:", missing_required)
-                if missing_preferred:
-                    st.write("Missing Preferred:", missing_preferred)
-
-                with st.expander("Include excluded skills (I have this skill)", expanded=False):
-                    if not st.session_state.resume_state:
-                        state_res = client.get(f"/resumes/{st.session_state.resume_id}")
-                        if state_res["ok"]:
-                            st.session_state.resume_state = state_res["data"].get("state")
-                    roles = role_options(st.session_state.resume_state or {})
-                    role_labels = [r[0] for r in roles]
-                    role_ids = [r[1] for r in roles]
-
-                    selected_items = []
-                    all_missing = list(missing_required) + list(missing_preferred)
-                    for idx, skill in enumerate(all_missing):
-                        include_key = f"include_skill_{idx}"
-                        role_key = f"include_role_{idx}"
-                        level_key = f"include_level_{idx}"
-                        bullet_key = f"include_bullet_{idx}"
-
-                        if st.checkbox(f"Include: {skill}", key=include_key):
-                            if roles:
-                                role_choice = st.selectbox(
-                                    f"Target Role for {skill}",
-                                    role_labels,
-                                    key=role_key,
-                                )
-                                role_id = role_ids[role_labels.index(role_choice)]
-                            else:
-                                role_id = ""
-                                st.warning("No roles available in resume state.")
-
-                            level = st.selectbox(
-                                f"Evidence Level for {skill}",
-                                options=["hands_on", "worked_with", "exposure"],
-                                key=level_key,
-                            )
-                            proof = st.text_area(
-                                f"Proof bullet for {skill} (optional)",
-                                key=bullet_key,
-                                placeholder="Optional: add context. Leave blank to auto-generate.",
-                            )
-
-                            selected_items.append({
-                                "skill": skill,
-                                "level": level,
-                                "role_id": role_id,
-                                "proof_bullet": proof,
-                            })
-
-                    if st.button("Include Selected Skills"):
-                        if not selected_items:
-                            st.error("Select at least one skill to include")
-                        else:
-                            invalid = [item for item in selected_items if not item["role_id"]]
-                            if invalid:
-                                st.error("Each selected skill needs a role")
-                            else:
-                                payload = {
-                                    "items": selected_items,
-                                    "jd_text": st.session_state.jd_text,
-                                    "truth_mode": st.session_state.truth_mode,
-                                    "strict_mode": True,
-                                    "rewrite_overrides_with_claude": True,
-                                    "export_docx": False,
-                                }
-                                res = client.post(
-                                    f"/resumes/{st.session_state.resume_id}/include-skills",
-                                    json_body=payload,
-                                )
-                                if res["ok"]:
-                                    st.success("Skills added to resume")
-                                    state_res = client.get(f"/resumes/{st.session_state.resume_id}")
-                                    if state_res["ok"]:
-                                        st.session_state.resume_state = state_res["data"].get("state")
-                                    else:
-                                        st.session_state.resume_state = res["data"].get("state")
-                                    if st.session_state.resume_state:
-                                        st.session_state.resume_text_preview = extract_resume_text(
-                                            st.session_state.resume_state
-                                        )
-                                else:
-                                    st.error(res["error"])
-            else:
-                st.info("All required skills are covered. Score may be capped if preferred skills are not detected.")
+        st.caption("Use the ATS popup for scoring, gap analysis, and skill include flow.")
+        if st.button("Open ATS Popup", key="open_ats_popup_left"):
+            _ats_score_dialog()
 
     # D) Blocked Plan + Overrides
     with st.expander("Blocked Plan + Overrides (Remediation)", expanded=False):
@@ -562,26 +667,39 @@ with col_left:
     # G) Final Save to Folder (DOCX Export)
     with st.expander("Final Save to Folder (DOCX Export)", expanded=False):
         if st.button("Save DOCX + JD"):
-            if not st.session_state.resume_id:
-                st.error("resume_id required")
-            elif not st.session_state.company_name or not st.session_state.position_name:
-                st.error("company_name and position_name are required")
-            else:
-                payload = {
-                    "resume_id": st.session_state.resume_id,
-                    "company_name": st.session_state.company_name,
-                    "position_name": st.session_state.position_name,
-                    "job_id": st.session_state.job_id or None,
-                    "jd_text": st.session_state.jd_text or None,
-                }
-                res = client.post("/export-docx", json_body=payload)
-                if res["ok"]:
-                    st.success("Export complete")
-                    st.json(res["data"])
+            _save_docx_export()
+
+        export_target = _get_export_open_target(st.session_state.get("last_export_data"))
+        if export_target:
+            st.caption(f"Saved path: {export_target}")
+            if st.button("Open Saved Resume Location", key="open_saved_resume_location"):
+                ok, msg = _open_path_in_file_manager(export_target)
+                if ok:
+                    st.success(msg)
                 else:
-                    st.error(res["error"])
+                    st.error(msg)
 
 with col_right:
+    st.markdown("### Quick Save")
+    quick_cols = st.columns([1, 1, 1], gap="small")
+    with quick_cols[0]:
+        if st.button("Save DOCX + JD", key="save_docx_quick_top"):
+            _save_docx_export()
+    with quick_cols[1]:
+        export_target_top = _get_export_open_target(st.session_state.get("last_export_data"))
+        open_disabled = not bool(export_target_top)
+        if st.button("Open Saved Location", key="open_saved_resume_location_top", disabled=open_disabled):
+            ok, msg = _open_path_in_file_manager(export_target_top or "")
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+    with quick_cols[2]:
+        if st.button("ATS Popup", key="open_ats_popup_top"):
+            _ats_score_dialog()
+    if export_target_top:
+        st.caption(f"Latest saved path: {export_target_top}")
+
     st.markdown("### Resume Preview")
     if st.session_state.resume_id:
         st.markdown(f"**Resume ID:** `{st.session_state.resume_id}`")

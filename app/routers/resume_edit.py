@@ -12,7 +12,7 @@ from app.services.resume_store import (
 )
 from app.services.resume_overrides import load_overrides
 from app.services.docx_exporter import export_docx_from_state
-from app.services.claude_client import generate_with_claude
+from app.services.llm_client import generate_with_llm
 from app.services.prompts import BULLET_REWRITE_SYSTEM_PROMPT, build_bullet_rewrite_prompt
 from app.services.outcome_enforcer import ensure_outcome_clause, ensure_metric_clause
 
@@ -144,9 +144,7 @@ def rewrite_bullet(resume_id: str, payload: BulletRewriteRequest) -> BulletRewri
     )
 
     try:
-        rewritten = generate_with_claude(
-            api_key=settings.anthropic_api_key,
-            model=settings.claude_model,
+        rewritten = generate_with_llm(
             system_prompt=BULLET_REWRITE_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             max_tokens=160,
