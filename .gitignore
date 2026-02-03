@@ -19,10 +19,10 @@ Thumbs.db
 # Local data/output
 # Keep resume directories but ignore DOCX artifacts
 storage/resumes/**/*.docx
+!storage/resumes/template/.gitkeep
 storage/index/
 storage/generated_resumes/
-resumes/
+/resumes/
 
 # Logs
 *.log
-storage/resumes/**/*.docx
