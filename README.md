@@ -26,6 +26,13 @@ Install UI deps (already in requirements.txt) and run:
 streamlit run ui/app.py
 ```
 
+### File/Folder locations
+- Resume uploads (source files): `storage/resumes/`
+- Generated resumes (JSON/state): `storage/generated_resumes/<resume_id>/`
+- DOCX template (local only, ignored by git): `storage/resumes/template/template.docx`
+  - Keep the folder tracked with `.gitkeep`; template.docx stays local and ignored
+- Exports / saved DOCX paths are returned in API responses and shown in the UI
+
 To point the UI at a different backend URL:
 
 ```
