@@ -26,17 +26,16 @@ logger = logging.getLogger(__name__)
 
 POLISH_SYSTEM = """You are a resume bullet polisher.
 Keep COMPANY, TITLE, DATES exactly as in the input. Do not add new roles or change headings.
-Allowed to add plausible metrics/outcomes; use light qualifiers (~, estimated) when inventing.
+Be assertive: never use hedge words (estimated, likely, approximately, about) and do not use "~".
 Rules:
 - Every bullet = Action + Outcome (prefer metrics: latency, throughput, error rate, $/time saved, tickets reduced).
 - Avoid repeating the same closing clause across bullets and avoid repeating "improve scalability" wording.
-- Vary verbs and endings; use impact verbs (cut, reduced, decreased, lowered, saved, increased, boosted, raised, accelerated, shortened, improved by ~X%, avoided, prevented).
+- Vary verbs and endings; use impact verbs (cut, reduced, decreased, lowered, saved, increased, boosted, raised, accelerated, shortened, improved by X%, avoided, prevented).
 - Keep bullets concise (1-2 lines), ATS-friendly, no tables.
 - Make phrasing impact-first when possible; clarify why frameworks/processes matter (e.g., faster onboarding, standardization).
 - Call out collaboration when evident (e.g., cross-functional teams, product/data/engineering).
 - Avoid parenthetical tool lists; weave tools inline.
-- Do NOT change or add tools/dates/companies beyond what is plausible for the existing roles.
-- If you use "estimated", attach it to a number (e.g., "estimated ~15%"). Do NOT write "using estimated" or leave it without a number."""
+- Do NOT change or add tools/dates/companies beyond what is plausible for the existing roles."""
 
 # Metric limiter and phrasing de-dupe
 _END_CLIP = re.compile(r"(by\s+~?\d+%|by\s+~?\d+\s*(ms|s|minutes|hours)|by\s+~?\d+\s*(requests|users|pipelines))", re.IGNORECASE)
@@ -59,6 +58,7 @@ _PARENS = re.compile(r"\(([^()]+)\)")
 _P_RESPONSE_TIMES = re.compile(r"\bp\s+response\s+times\b", re.IGNORECASE)
 _P_RESPONSE = re.compile(r"\bp\s+response\b", re.IGNORECASE)
 _S_TRIGGERS = re.compile(r"\band\s+S\s+triggers\b", re.IGNORECASE)
+_HEDGE_WORDS = re.compile(r"\b(estimated|likely|approximately|about)\b", re.IGNORECASE)
 _BULLET_LINE = re.compile(r"^\s*[-*\u2022]\s+")
 _TILDE_CHARS = re.compile(r"[~∼˜～]")
 _MAX_METRICS_PER_ROLE = 4
@@ -132,6 +132,7 @@ def _postprocess_metrics_and_phrasing(resume_text: str) -> str:
         bullet = _P_RESPONSE_TIMES.sub("p95 response times", bullet)
         bullet = _P_RESPONSE.sub("p95 response", bullet)
         bullet = _S_TRIGGERS.sub("and S3 triggers", bullet)
+        bullet = _HEDGE_WORDS.sub("", bullet)
         if "(" in bullet and ")" in bullet:
             bullet = _PARENS.sub(lambda m: "using " + m.group(1), bullet)
         bullet = re.sub(r"\s{2,}", " ", bullet).rstrip(" ,.;:-")

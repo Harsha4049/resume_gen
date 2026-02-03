@@ -38,6 +38,27 @@ _SYNONYMS = {
     "rest": ["rest api", "restful"],
 }
 
+_MUST_HAVE_DOMAINS = [
+    "mqtt",
+    "opc ua",
+    "opc-ua",
+    "opcua",
+    "modbus",
+    "bacnet",
+    "scada",
+    "mes",
+    "historian",
+    "pi",
+    "osisoft",
+    "ignition",
+    "plc",
+    "iiot",
+    "ot",
+    "influxdb",
+    "timescaledb",
+    "opc",
+]
+
 
 def extract_skills_from_jd(jd_text: str, top_n_skills: int = 25) -> Dict[str, List[str]]:
     """Extract required/preferred skills from JD using deterministic heuristics."""
@@ -79,7 +100,7 @@ def score_resume_against_jd(
     top_n_skills: int = 25,
     strict_mode: bool = True,
 ) -> AtsScoreResponse:
-    """Compute ATS score and evidence map."""
+    """Compute ATS score and evidence map with keyword + credibility blend and hard caps for missing must-haves."""
     skills = extract_skills_from_jd(jd_text, top_n_skills=top_n_skills)
     required = skills.get("required", [])
     preferred = skills.get("preferred", [])
@@ -93,21 +114,42 @@ def score_resume_against_jd(
     req_total = len(required) or 0
     pref_total = len(preferred) or 0
 
-    score = 0
+    keyword_score = 0
     if req_total or pref_total:
         req_ratio = (req_covered / req_total) if req_total else 0
         pref_ratio = (pref_covered / pref_total) if pref_total else 0
         if pref_total == 0:
-            score = round(req_ratio * 100)
+            keyword_score = round(req_ratio * 100)
         else:
-            score = round(req_ratio * 70 + pref_ratio * 30)
-    score = max(0, min(100, score))
+            keyword_score = round(req_ratio * 70 + pref_ratio * 30)
+    keyword_score = max(0, min(100, keyword_score))
+
+    # Role-fit / credibility: count direct evidence on required skills only
+    direct_req = sum(1 for item in req_coverage if item.status == "direct")
+    role_score = round((direct_req / req_total) * 100) if req_total else keyword_score
+
+    final_score = round(keyword_score * 0.6 + role_score * 0.4)
+    capped_reason = None
+
+    missing_must_have: List[str] = []
+    must_have_hit = _must_have_gates(jd_text)
+    if must_have_hit:
+        for skill in must_have_hit:
+            if not has_direct_evidence(state, skill):
+                missing_must_have.append(skill)
+    if missing_must_have:
+        capped_reason = "Missing domain must-have evidence"
+        final_score = min(final_score, 40)
 
     missing_required = [item.skill for item in req_coverage if item.status == "missing"]
     missing_preferred = [item.skill for item in pref_coverage if item.status == "missing"]
 
     return AtsScoreResponse(
-        ats_score=score,
+        ats_score=final_score,
+        keyword_score=keyword_score,
+        role_score=role_score,
+        capped_reason=capped_reason,
+        missing_must_have=_dedupe_preserve(missing_must_have) if missing_must_have else None,
         required=req_coverage,
         preferred=pref_coverage,
         missing_required=missing_required,
@@ -224,6 +266,12 @@ def has_direct_evidence(state: ResumeState, skill: str) -> bool:
         if any(_has_token(bullet, token) for bullet in role.bullets):
             return True
     return False
+
+
+def _must_have_gates(jd_text: str) -> List[str]:
+    lower = jd_text.lower()
+    hits = [kw for kw in _MUST_HAVE_DOMAINS if kw in lower]
+    return _dedupe_preserve(hits)
 
 
 def _dedupe_preserve(values: List[str]) -> List[str]:

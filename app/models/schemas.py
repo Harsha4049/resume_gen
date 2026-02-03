@@ -224,6 +224,10 @@ class SkillCoverage(BaseModel):
 
 class AtsScoreResponse(BaseModel):
     ats_score: int
+    keyword_score: Optional[int] = None
+    role_score: Optional[int] = None
+    capped_reason: Optional[str] = None
+    missing_must_have: Optional[List[str]] = None
     required: List[SkillCoverage]
     preferred: List[SkillCoverage]
     missing_required: List[str]
